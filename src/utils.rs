@@ -1,16 +1,16 @@
 use std::io::{stdin, stdout, Write};
+use std::path::Path;
 
 use indicatif::{ProgressBar, ProgressStyle};
-use reqwest::Client;
-use std::path::Path;
-use sha256::try_digest;
 use log4rs::{Config, Handle};
 use log4rs::append::file::FileAppender;
-use log4rs::encode::pattern::PatternEncoder;
 use log4rs::config::{Appender, Root};
+use log4rs::encode::pattern::PatternEncoder;
 use log::LevelFilter;
-use crate::r#const::HEADER;
+use reqwest::Client;
+use sha256::try_digest;
 
+use crate::r#const;
 
 pub fn get_user_input(text: &str) -> String {
     stdout().write_all(text.as_ref()).unwrap();
@@ -23,7 +23,7 @@ pub fn get_user_input(text: &str) -> String {
 }
 
 pub fn create_client() -> Client {
-    let client = Client::builder().user_agent(HEADER).build();
+    let client = Client::builder().user_agent(r#const::HEADER).build();
 
     return match client {
         Ok(client) => client,

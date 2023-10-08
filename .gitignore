@@ -1,2 +1,4 @@
 /target
 .idea
+/Cargo.lock
+/normal_logs.log

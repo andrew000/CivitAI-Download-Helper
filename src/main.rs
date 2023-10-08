@@ -10,13 +10,10 @@ use log::error;
 use reqwest::Client;
 use tokio::time::sleep;
 
-use crate::r#const::MAX_TRIES;
-use crate::utils::{set_pb_error_style, set_pb_main_style, set_pb_normal_style};
-
 mod r#const;
 mod utils;
 
-async fn get_file_info(client: &Client, url: &String) -> (String, u64, String) {
+async fn get_file_info<'a>(client: &'a Client, url: &'a String) -> (String, u64, String) {
     let res = match client.get(url).send().await {
         Ok(res) => res,
         Err(e) => panic!("Error getting file info: {:?}", e),
@@ -65,18 +62,24 @@ async fn download_part<'a>(
     end: &'a u64,
     pb: ProgressBar,
     main_pb: ProgressBar,
-) -> Result<(), Error> {
+    use_little_buffer: &'a bool,
+) -> Result<BufWriter<File>, Error> {
     pb.set_position(0);
 
-    let file = match File::options().write(true).open(&filename) {
-        Ok(file) => file,
-        Err(e) => panic!("Error opening file: {:?}", e),
-    };
+    'downloading: for i in 0..r#const::MAX_TRIES {
+        let file = match File::options().write(true).open(&filename) {
+            Ok(mut file) => {
+                file.seek(io::SeekFrom::Start(*start)).unwrap();
+                file
+            }
+            Err(e) => panic!("Error opening file: {:?}", e),
+        };
 
-    let mut buffer = BufWriter::new(file);
-
-    'downloading: for i in 0..MAX_TRIES {
-        buffer.seek(io::SeekFrom::Start(*start)).unwrap();
+        let mut buffer = if *use_little_buffer {
+            BufWriter::new(file)
+        } else {
+            BufWriter::with_capacity((*end - *start) as usize, file)
+        };
 
         let stream = match client
             .get(url)
@@ -111,7 +114,7 @@ async fn download_part<'a>(
                         );
                         main_pb.set_position(main_pb.position() - pb.position());
                         pb.set_position(0);
-                        set_pb_error_style(&pb);
+                        utils::set_pb_error_style(&pb);
                         sleep(std::time::Duration::from_secs(3)).await;
                         continue 'downloading;
                     }
@@ -123,30 +126,45 @@ async fn download_part<'a>(
                     );
                     main_pb.set_position(main_pb.position() - pb.position());
                     pb.set_position(0);
-                    set_pb_error_style(&pb);
+                    utils::set_pb_error_style(&pb);
                     sleep(std::time::Duration::from_secs(3)).await;
                     continue 'downloading;
                 }
             };
         }
-        buffer.flush().unwrap();
-        drop(buffer);
-        return Ok(());
+        return Ok(buffer);
     }
     error!("Max tries exceeded for range: {}-{}", start, end);
     return Err(Error::new(io::ErrorKind::Other, "Max tries exceeded"));
 }
 
-async fn start_download_process(
-    client: &Client,
-    url: &String,
-    filename: &String,
-    ranges: &Vec<(u64, u64)>,
+async fn start_download_process<'a>(
+    client: &'a Client,
+    url: &'a String,
+    filename: &'a String,
+    ranges: &'a Vec<(u64, u64)>,
+    use_little_buffer: &'a bool,
 ) {
-    if !Path::new(&filename).exists() {
+    if Path::new(&filename).exists() {
+        if utils::get_user_input("File already exists. Overwrite? [y/N]: ").to_lowercase() != "y" {
+            error!("File {:?} already exists", filename);
+            panic!("File {:?} already exists", filename);
+        } else {
+            match File::options().write(true).truncate(true).open(&filename) {
+                Ok(file) => file.set_len(ranges.last().unwrap().1).unwrap(),
+                Err(e) => {
+                    error!("Error creating file: {:?}", e);
+                    panic!("Error creating file: {:?}", e);
+                }
+            };
+        }
+    } else {
         match File::create(&filename) {
-            Ok(file) => file,
-            Err(e) => panic!("Error creating file: {:?}", e),
+            Ok(file) => file.set_len(ranges.last().unwrap().1).unwrap(),
+            Err(e) => {
+                error!("Error creating file: {:?}", e);
+                panic!("Error creating file: {:?}", e);
+            }
         };
     }
 
@@ -154,14 +172,14 @@ async fn start_download_process(
         MultiProgress::with_draw_target(indicatif::ProgressDrawTarget::stdout_with_hz(3));
 
     let main_pb = ProgressBar::new(ranges.last().unwrap().1 - ranges.first().unwrap().0);
-    set_pb_main_style(&main_pb);
+    utils::set_pb_main_style(&main_pb);
     multi_progress.add(main_pb.clone());
 
     let mut download_futures = Vec::new();
 
     for (start, end) in ranges {
         let pb = ProgressBar::new(*end - *start);
-        set_pb_normal_style(&pb);
+        utils::set_pb_normal_style(&pb);
         multi_progress.add(pb.clone());
         download_futures.push(download_part(
             &client,
@@ -171,10 +189,19 @@ async fn start_download_process(
             &end,
             pb.clone(),
             main_pb.clone(),
+            &use_little_buffer,
         ));
     }
 
-    futures_util::future::join_all(download_futures).await;
+    for buffer in futures_util::future::join_all(download_futures).await {
+        match buffer {
+            Ok(mut buffer) => {
+                buffer.flush().unwrap();
+                drop(buffer);
+            }
+            Err(e) => panic!("Error downloading file: {:?}", e),
+        }
+    }
 }
 
 #[tokio::main]
@@ -189,6 +216,9 @@ async fn main() {
     }
 
     let threads = <u8>::from_str(&threads).unwrap();
+
+    let use_little_buffer =
+        utils::get_user_input("Use little buffer? [y/N]: ").to_lowercase() == "y";
 
     let client = utils::create_client();
     let (file_name, file_size, download_url) = get_file_info(&client, &url).await;
@@ -208,10 +238,17 @@ async fn main() {
             download_ranges.last().unwrap()
         );
     } else {
-        println!("Range #0: {:?}", download_ranges[0]);
+        println!("Range #0: {:?}", download_ranges.first().unwrap());
     }
 
-    start_download_process(&client, &download_url, &file_name, &download_ranges).await;
+    start_download_process(
+        &client,
+        &download_url,
+        &file_name,
+        &download_ranges,
+        &use_little_buffer,
+    )
+        .await;
 
     // Calc checksum sha256
     utils::calculate_checksum(&file_name);
